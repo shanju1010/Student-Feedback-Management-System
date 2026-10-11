@@ -1,0 +1,13 @@
+.venv/
+backend/.venv/
+__pycache__/
+*.pyc
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+*.zip
+.vscode/

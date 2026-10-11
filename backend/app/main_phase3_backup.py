@@ -1,0 +1,296 @@
+import os
+import secrets
+import hashlib
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from fastapi import FastAPI, Depends, HTTPException, Response, Request
+from fastapi.responses import FileResponse
+from pathlib import Path
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import create_engine, ForeignKey, String, DateTime, Integer, UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, VerificationError
+
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./sfms.db')
+engine = create_engine(DATABASE_URL, connect_args={'check_same_thread': False} if DATABASE_URL.startswith('sqlite') else {})
+SessionLocal = sessionmaker(bind=engine)
+password_hash = PasswordHasher()
+
+def verify_password(plain: str, stored: str) -> bool:
+    try:
+        return password_hash.verify(stored, plain)
+    except (VerifyMismatchError, VerificationError):
+        return False
+COOKIE_NAME = 'sfms_session'
+SESSION_HOURS = 8
+
+class Base(DeclarativeBase): pass
+class Role(str, Enum):
+    student = 'student'
+    faculty = 'faculty'
+    admin = 'admin'
+
+class User(Base):
+    __tablename__ = 'users'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(20), default=Role.student.value)
+    is_active: Mapped[bool] = mapped_column(default=True)
+
+class Subject(Base):
+    __tablename__ = 'subjects'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(30), unique=True)
+    name: Mapped[str] = mapped_column(String(200))
+    active: Mapped[bool] = mapped_column(default=True)
+
+class FacultyAssignment(Base):
+    __tablename__ = 'faculty_assignments'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey('subjects.id'))
+    faculty_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    __table_args__ = (UniqueConstraint('subject_id', 'faculty_id'),)
+
+class FeedbackCycle(Base):
+    __tablename__ = 'feedback_cycles'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+class FeedbackSubmission(Base):
+    __tablename__ = 'feedback_submissions'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    subject_id: Mapped[int] = mapped_column(ForeignKey('subjects.id'))
+    faculty_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    cycle_id: Mapped[int] = mapped_column(ForeignKey('feedback_cycles.id'))
+    rating: Mapped[int] = mapped_column(Integer)
+    comment: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (UniqueConstraint('student_id', 'subject_id', 'faculty_id', 'cycle_id'),)
+
+class LoginSession(Base):
+    __tablename__ = 'login_sessions'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+Base.metadata.create_all(bind=engine)  # Development bootstrap; replace with Alembic migrations before production.
+app = FastAPI(title='SFMS Authentication API')
+
+class LoginInput(BaseModel):
+    email: str
+    password: str
+
+class UserOutput(BaseModel):
+    id: int
+    email: str
+    role: Role
+    model_config = {'from_attributes': True}
+
+def db_session():
+    with SessionLocal() as db:
+        yield db
+
+def digest(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def authenticated_user(request: Request, db: Session = Depends(db_session)) -> User:
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        raise HTTPException(401, 'Authentication required')
+    session = db.query(LoginSession).filter_by(token_hash=digest(token)).first()
+    if not session or session.expires_at.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
+        raise HTTPException(401, 'Session expired or invalid')
+    user = db.get(User, session.user_id)
+    if not user or not user.is_active:
+        raise HTTPException(401, 'Account unavailable')
+    return user
+
+def require_role(*roles: Role):
+    def check(user: User = Depends(authenticated_user)) -> User:
+        if user.role not in [r.value for r in roles]:
+            raise HTTPException(403, 'Insufficient permissions')
+        return user
+    return check
+
+@app.get('/health')
+def health():
+    return {'status': 'ok'}
+
+@app.post('/auth/login', response_model=UserOutput)
+def login(data: LoginInput, response: Response, db: Session = Depends(db_session)):
+    user = db.query(User).filter_by(email=data.email.strip().lower()).first()
+    if not user or not user.is_active or not verify_password(data.password, user.password_hash):
+        raise HTTPException(401, 'Invalid credentials')
+    token = secrets.token_urlsafe(32)
+    db.add(LoginSession(token_hash=digest(token), user_id=user.id, expires_at=datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)))
+    db.commit()
+    response.set_cookie(COOKIE_NAME, token, httponly=True, secure=os.getenv('COOKIE_SECURE', 'false').lower() == 'true', samesite='lax', max_age=SESSION_HOURS * 3600)
+    return user
+
+@app.post('/auth/logout')
+def logout(request: Request, response: Response, db: Session = Depends(db_session)):
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        db.query(LoginSession).filter_by(token_hash=digest(token)).delete()
+        db.commit()
+    response.delete_cookie(COOKIE_NAME, samesite='lax', secure=os.getenv('COOKIE_SECURE', 'false').lower() == 'true')
+    return {'message': 'Logged out'}
+
+@app.get('/auth/me', response_model=UserOutput)
+def me(user: User = Depends(authenticated_user)):
+    return user
+
+@app.get('/admin/check')
+def admin_check(user: User = Depends(require_role(Role.admin))):
+    return {'message': 'Admin access granted'}
+
+# SFMS PHASE 3 API START
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
+
+class FeedbackInput(BaseModel):
+    subject_id: int = Field(gt=0)
+    faculty_id: int = Field(gt=0)
+    cycle_id: int = Field(gt=0)
+    rating: int = Field(ge=1, le=5)
+    comment: str | None = Field(default=None, max_length=1000)
+
+
+def check_same_origin(request: Request):
+    # A session cookie authenticates the user; this additionally blocks
+    # cross-origin browser submissions on the state-changing feedback route.
+    origin = request.headers.get('origin')
+    if origin:
+        from urllib.parse import urlsplit
+        try:
+            source = urlsplit(origin)
+            target = urlsplit(str(request.base_url))
+            if (source.scheme, source.netloc) != (target.scheme, target.netloc):
+                raise HTTPException(403, 'Cross-origin request rejected')
+        except ValueError:
+            raise HTTPException(403, 'Invalid request origin')
+    else:
+        # Browsers send Origin for cross-origin requests; reject cross-site
+        # requests even when Origin is absent if Fetch Metadata says cross-site.
+        if request.headers.get('sec-fetch-site') == 'cross-site':
+            raise HTTPException(403, 'Cross-site request rejected')
+
+
+def as_utc(value: datetime) -> datetime:
+    # SQLite commonly returns naive datetime objects for stored UTC values.
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+@app.get('/api/subjects')
+def api_subjects(
+    user: User = Depends(require_role(Role.student, Role.faculty, Role.admin)),
+    db: Session = Depends(db_session),
+):
+    rows = (
+        db.query(Subject, FacultyAssignment, User)
+        .join(FacultyAssignment, FacultyAssignment.subject_id == Subject.id)
+        .join(User, User.id == FacultyAssignment.faculty_id)
+        .filter(Subject.active.is_(True), User.is_active.is_(True), User.role == Role.faculty.value)
+        .order_by(Subject.code, User.email)
+        .all()
+    )
+    now = datetime.now(timezone.utc)
+    cycles = db.query(FeedbackCycle).all()
+    active_cycles = [
+        {'id': cycle.id, 'name': cycle.name, 'starts_at': as_utc(cycle.starts_at).isoformat(), 'ends_at': as_utc(cycle.ends_at).isoformat()}
+        for cycle in cycles
+        if as_utc(cycle.starts_at) <= now <= as_utc(cycle.ends_at)
+    ]
+    return {
+        'subjects': [
+            {'id': subject.id, 'code': subject.code, 'name': subject.name,
+             'faculty_id': faculty.id, 'faculty_email': faculty.email}
+            for subject, _assignment, faculty in rows
+        ],
+        'active_cycles': active_cycles,
+    }
+
+
+@app.post('/api/feedback', status_code=201)
+def api_submit_feedback(
+    payload: FeedbackInput,
+    request: Request,
+    user: User = Depends(require_role(Role.student)),
+    db: Session = Depends(db_session),
+):
+    check_same_origin(request)
+    subject = db.get(Subject, payload.subject_id)
+    if subject is None or not subject.active:
+        raise HTTPException(404, 'Subject not found or inactive')
+    faculty = db.get(User, payload.faculty_id)
+    if faculty is None or not faculty.is_active or faculty.role != Role.faculty.value:
+        raise HTTPException(400, 'Invalid faculty account')
+    assignment = db.query(FacultyAssignment).filter_by(
+        subject_id=payload.subject_id, faculty_id=payload.faculty_id
+    ).first()
+    if assignment is None:
+        raise HTTPException(400, 'Faculty is not assigned to this subject')
+    cycle = db.get(FeedbackCycle, payload.cycle_id)
+    if cycle is None:
+        raise HTTPException(404, 'Feedback cycle not found')
+    now = datetime.now(timezone.utc)
+    if not (as_utc(cycle.starts_at) <= now <= as_utc(cycle.ends_at)):
+        raise HTTPException(400, 'Feedback cycle is not currently active')
+    duplicate = db.query(FeedbackSubmission).filter_by(
+        student_id=user.id, subject_id=payload.subject_id,
+        faculty_id=payload.faculty_id, cycle_id=payload.cycle_id,
+    ).first()
+    if duplicate:
+        raise HTTPException(409, 'Feedback already submitted for this subject, faculty, and cycle')
+    submission = FeedbackSubmission(
+        student_id=user.id, subject_id=payload.subject_id,
+        faculty_id=payload.faculty_id, cycle_id=payload.cycle_id,
+        rating=payload.rating, comment=payload.comment,
+        created_at=now,
+    )
+    db.add(submission)
+    try:
+        db.commit()
+        db.refresh(submission)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, 'Feedback already submitted')
+    return {'id': submission.id, 'message': 'Feedback submitted successfully'}
+
+
+@app.get('/api/feedback/mine')
+def api_my_feedback(
+    user: User = Depends(require_role(Role.student)),
+    db: Session = Depends(db_session),
+):
+    rows = (
+        db.query(FeedbackSubmission, Subject, User, FeedbackCycle)
+        .join(Subject, FeedbackSubmission.subject_id == Subject.id)
+        .join(User, FeedbackSubmission.faculty_id == User.id)
+        .join(FeedbackCycle, FeedbackSubmission.cycle_id == FeedbackCycle.id)
+        .filter(FeedbackSubmission.student_id == user.id)
+        .order_by(FeedbackSubmission.created_at.desc())
+        .all()
+    )
+    return {'submissions': [
+        {'id': feedback.id, 'subject_id': subject.id, 'subject_code': subject.code,
+         'subject_name': subject.name, 'faculty_id': faculty.id,
+         'faculty_email': faculty.email, 'cycle_id': cycle.id,
+         'cycle_name': cycle.name, 'rating': feedback.rating,
+         'comment': feedback.comment, 'created_at': as_utc(feedback.created_at).isoformat()}
+        for feedback, subject, faculty, cycle in rows
+    ]}
+# SFMS PHASE 3 API END
+
+# Serve frontend and API from the same origin so session cookies work without CORS.
+FRONTEND_FILE = Path(__file__).resolve().parent.parent / 'frontend' / 'index.html'
+
+@app.get('/', include_in_schema=False)
+def frontend_home():
+    return FileResponse(FRONTEND_FILE)
