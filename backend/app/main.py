@@ -161,7 +161,36 @@ class LoginSession(Base):
 
 
 Base.metadata.create_all(bind=engine)  # Development bootstrap; replace with Alembic migrations before production.
+def create_initial_admin():
+    email = os.getenv("INITIAL_ADMIN_EMAIL")
+    password = os.getenv("INITIAL_ADMIN_PASSWORD")
 
+    if not email or not password:
+        return
+
+    if len(password) < 12:
+        raise RuntimeError("Initial admin password must be at least 12 characters")
+
+    with SessionLocal() as db:
+        existing = db.query(User).filter_by(
+            email=email.strip().lower()
+        ).first()
+
+        if existing:
+            return
+
+        admin = User(
+            email=email.strip().lower(),
+            password_hash=password_hash.hash(password),
+            role=Role.admin.value,
+            is_active=True
+        )
+
+        db.add(admin)
+        db.commit()
+
+
+create_initial_admin()
 app = FastAPI(title='SFMS Authentication API')
 
 
